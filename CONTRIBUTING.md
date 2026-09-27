@@ -30,7 +30,9 @@ uv run pytest --cov
 ```
 
 The suite has to keep 100% line and branch coverage; `--cov` fails below that. CI runs the
-tests on Python 3.10 through 3.14, runs every pre-commit hook, and builds the container image.
+tests on Python 3.10 through 3.14, runs every pre-commit hook, and builds and tests the
+container image for amd64 and arm64. Pushes to `main` and `v*` tags publish the image to
+`ghcr.io`.
 
 ## Rules
 

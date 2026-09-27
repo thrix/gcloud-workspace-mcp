@@ -14,3 +14,5 @@ First release.
   `docs_replace_content`, `docs_append_text`, `gmail_create_draft`.
 - Tokens only go to `https://*.googleapis.com`. The server refuses any other URL.
 - `Containerfile` with the Google Cloud SDK on a distroless Hummingbird Python image.
+- CI publishes amd64 and arm64 images to `ghcr.io/thrix/gcloud-workspace-mcp` with build
+  provenance attestations.

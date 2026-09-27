@@ -13,17 +13,19 @@ jobs:
   pre-commit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
-          # gitleaks scans the commit range, so it needs history.
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
-      - uses: actions/cache@v4
+      - uses: astral-sh/setup-uv@v10
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
-      # pytest runs across the Python matrix below.
-      - run: SKIP=pytest uv run pre-commit run --all-files --show-diff-on-failure
+      # pytest runs across the Python matrix below. The gitleaks hook only reads
+      # staged changes, so the next step scans the full history instead.
+      - run: SKIP=pytest,gitleaks uv run pre-commit run --all-files --show-diff-on-failure
+      - name: gitleaks (full history)
+        run: podman run --rm -v "$PWD:/repo:ro,z" ghcr.io/gitleaks/gitleaks:v8.30.0 git /repo --redact --verbose
 
   test:
     runs-on: ubuntu-latest
@@ -32,25 +34,8 @@ jobs:
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ matrix.python }}
       - run: uv run pytest -v --cov
-
-  container:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: podman build -t gcloud-workspace-mcp .
-      - name: gcloud runs inside the image
-        run: podman run --rm --entrypoint gcloud gcloud-workspace-mcp version
-      - name: server lists its tools over stdio
-        run: |
-          init='{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}'
-          printf '%s\n' \
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":$init}" \
-            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-            | timeout 60 podman run -i --rm gcloud-workspace-mcp \
-            | tee /dev/stderr | grep -q '"drive_search"'
