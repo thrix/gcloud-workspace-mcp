@@ -1,0 +1,54 @@
+[project]
+name = "gcloud-workspace-mcp"
+dynamic = ["version"]
+description = "MCP server for Google Docs, Drive and Gmail that authenticates through the local gcloud CLI"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Miroslav Vadkerti", email = "mvadkert@redhat.com" }]
+requires-python = ">=3.10"
+dependencies = ["mcp>=2,<3"]
+keywords = ["mcp", "gcloud", "google-drive", "google-docs", "gmail"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Email",
+    "Topic :: Office/Business",
+]
+
+[project.urls]
+Homepage = "https://github.com/thrix/gcloud-workspace-mcp"
+Issues = "https://github.com/thrix/gcloud-workspace-mcp/issues"
+
+[project.scripts]
+gcloud-workspace-mcp = "gcloud_workspace_mcp.server:main"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/gcloud_workspace_mcp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gcloud_workspace_mcp"]
+
+[tool.ruff]
+line-length = 99
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S105", "S106"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
