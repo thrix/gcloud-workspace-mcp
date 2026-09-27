@@ -179,3 +179,78 @@ def test_gmail_create_draft_rejects_header_injection(field: str) -> None:
     args[field] = "x\r\nBcc: evil@x"
     with pytest.raises(WorkspaceError, match="line breaks"):
         gmail.gmail_create_draft(**args)
+
+
+def test_part_without_inline_data_is_skipped() -> None:
+    payload = {
+        "mimeType": "multipart/alternative",
+        "parts": [
+            {"mimeType": "text/plain", "body": {"attachmentId": "big", "size": 90000}},
+            {"mimeType": "text/html", "body": {"data": b64url("<p>fallback</p>")}},
+        ],
+    }
+    assert gmail.extract_body(payload) == "fallback"
+
+
+def test_html_nested_skip_tags_and_stray_end_tags() -> None:
+    html = "</style><head><title>T</title><style>x</style></head><p>kept</p><br>line"
+    assert gmail.html_to_text(html) == "kept\n\nline"
+
+
+def test_simplify_message_without_payload() -> None:
+    assert gmail.simplify_message({"id": "m"}) == {
+        "id": "m",
+        "threadId": None,
+        "labelIds": [],
+        "headers": {},
+        "body": "",
+    }
+
+
+def test_gmail_get_thread_raw_formats_pass_through(google: FakeGoogle) -> None:
+    google.queue_json({"id": "t1", "messages": [{"id": "m1", "snippet": "s"}]})
+    out = json.loads(gmail.gmail_get_thread("t1", "metadata"))
+    assert out == {"id": "t1", "messages": [{"id": "m1", "snippet": "s"}]}
+    assert "format=metadata" in google.requests[0].full_url
+
+
+def test_gmail_search_clamps_max_results(google: FakeGoogle) -> None:
+    google.queue_json({})
+    out = json.loads(gmail.gmail_search("x", max_results=0))
+    assert out == {"messages": [], "nextPageToken": None, "resultSizeEstimate": None}
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(google.requests[0].full_url).query)
+    assert query["maxResults"] == ["1"]
+    assert "pageToken" not in query
+
+
+@pytest.mark.parametrize(
+    "thread",
+    [
+        {},
+        {"messages": []},
+        {"messages": [{"payload": {"headers": headers(Subject="no id")}}]},
+        {"messages": [{}]},
+    ],
+)
+def test_reply_without_message_id_still_threads(google: FakeGoogle, thread: dict) -> None:
+    google.queue_json(thread, {"id": "d1", "message": {"id": "m9", "threadId": "t1"}})
+    gmail.gmail_create_draft("b@x", "Re: Hi", "ok", thread_id="t1")
+    payload, mime = _sent_mime(google)
+    assert payload["message"]["threadId"] == "t1"
+    assert mime["In-Reply-To"] is None
+    assert mime["References"] is None
+
+
+def test_reply_headers_request_only_threading_headers(google: FakeGoogle) -> None:
+    google.queue_json({"messages": []})
+    gmail._reply_headers("t/1")
+    url = google.requests[0].full_url
+    assert "/threads/t%2F1?" in url
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    assert query == {"format": ["metadata"], "metadataHeaders": ["Message-ID", "References"]}
+
+
+def test_gmail_create_draft_empty_response(google: FakeGoogle) -> None:
+    google.queue_json({})
+    out = json.loads(gmail.gmail_create_draft("b@x", "s", "b"))
+    assert out == {"draftId": None, "messageId": None, "threadId": None}

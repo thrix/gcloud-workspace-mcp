@@ -107,3 +107,32 @@ def test_docs_append_text(google: FakeGoogle) -> None:
     assert json.loads(req.data) == {
         "requests": [{"insertText": {"endOfSegmentLocation": {}, "text": "more\n"}}]
     }
+
+
+def test_docs_export_pdf_is_base64(google: FakeGoogle) -> None:
+    google.queue(FakeResponse(b"%PDF-1.7", "application/pdf"))
+    header, encoded = drive.docs_export("d", "application/pdf").split("\n", 1)
+    assert header == "[binary application/pdf, base64-encoded below; 8 bytes]"
+    assert base64.b64decode(encoded) == b"%PDF-1.7"
+    assert _query(google.requests[0])["mimeType"] == ["application/pdf"]
+
+
+def test_drive_get_metadata(google: FakeGoogle) -> None:
+    google.queue_json({"id": "f", "name": "n"})
+    assert json.loads(drive.drive_get_metadata("f")) == {"id": "f", "name": "n"}
+    q = _query(google.requests[0])
+    assert "owners(displayName,emailAddress)" in q["fields"][0]
+    assert q["supportsAllDrives"] == ["true"]
+
+
+def test_drive_download_text_like_application_types(google: FakeGoogle) -> None:
+    google.queue_json({"id": "f", "name": "a.json", "mimeType": "application/json"})
+    google.queue(FakeResponse(b'{"a": 1}', "application/json"))
+    assert drive.drive_download("f") == '{"a": 1}'
+
+
+def test_docs_create_from_markdown_without_parent(google: FakeGoogle) -> None:
+    google.queue_json({"id": "new"})
+    drive.docs_create_from_markdown("T", "x")
+    body = google.requests[0].data
+    assert b'"parents"' not in body

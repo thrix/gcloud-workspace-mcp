@@ -142,3 +142,26 @@ def test_token_cache_repr_hides_token(google: FakeGoogle) -> None:
     auth.USER_TOKEN.get()
     assert SENTINEL_TOKEN not in repr(auth.USER_TOKEN)
     assert gmail.ADC_TOKEN is auth.ADC_TOKEN
+
+
+def test_main_runs_stdio_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    ran: list[set[str]] = []
+    monkeypatch.setattr(
+        server.MCPServer, "run", lambda self, *a, **kw: ran.append(_tool_names(self))
+    )
+    monkeypatch.setenv(server.ENABLE_WRITES_ENV, "1")
+    server.main()
+    assert ran == [READ_NAMES | WRITE_NAMES]
+
+
+def test_server_metadata() -> None:
+    from gcloud_workspace_mcp import __version__
+
+    srv = server.build_server(enable_writes=False)
+    assert srv.name == "gcloud-workspace-mcp"
+    assert srv.version == __version__
+
+
+def test_writes_env_ignores_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(server.ENABLE_WRITES_ENV, " 1 ")
+    assert server.writes_enabled()

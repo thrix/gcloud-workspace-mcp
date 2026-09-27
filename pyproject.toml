@@ -25,9 +25,11 @@ gcloud-workspace-mcp = "gcloud_workspace_mcp.server:main"
 
 [dependency-groups]
 dev = [
+    "mypy>=2.3.1",
     "pre-commit>=4.6.2",
     "pytest>=8",
-    "ruff>=0.6",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.9",
 ]
 
 [build-system]
@@ -50,5 +52,20 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "RUF"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106"]
 
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+strict = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["gcloud_workspace_mcp"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+skip_covered = true
+exclude_also = ['if __name__ == "__main__":']

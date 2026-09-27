@@ -6,6 +6,7 @@ import base64
 import json
 import urllib.parse
 import uuid
+from typing import Any
 
 from .auth import USER_TOKEN, WorkspaceError
 from .http import DOCS_BASE, DRIVE_BASE, DRIVE_UPLOAD_BASE, get_json, quote, request, send_json
@@ -78,9 +79,12 @@ def drive_search(query: str, page_size: int = 20, page_token: str = "") -> str:
     )
 
 
-def _metadata(file_id: str, fields: str) -> dict:
+def _metadata(file_id: str, fields: str) -> dict[str, Any]:
     params = urllib.parse.urlencode({"fields": fields, "supportsAllDrives": "true"})
-    return get_json(f"{DRIVE_BASE}/files/{quote(file_id)}?{params}", token_cache=USER_TOKEN)
+    data: dict[str, Any] = get_json(
+        f"{DRIVE_BASE}/files/{quote(file_id)}?{params}", token_cache=USER_TOKEN
+    )
+    return data
 
 
 def drive_get_metadata(file_id: str) -> str:
@@ -169,7 +173,9 @@ def drive_download(file_id: str) -> str:
 # ---------------------------------- writes ---------------------------------
 
 
-def _multipart_related(metadata: dict, media: bytes, media_type: str) -> tuple[bytes, str]:
+def _multipart_related(
+    metadata: dict[str, Any], media: bytes, media_type: str
+) -> tuple[bytes, str]:
     boundary = f"gcloud-workspace-mcp-{uuid.uuid4().hex}"
     body = b"".join(
         [
@@ -198,7 +204,7 @@ def docs_create_from_markdown(title: str, markdown: str, parent_id: str = "") ->
     Returns:
         A JSON object `{id, name, webViewLink}` for the new document.
     """
-    metadata: dict = {"name": title, "mimeType": GOOGLE_DOC_MIME}
+    metadata: dict[str, Any] = {"name": title, "mimeType": GOOGLE_DOC_MIME}
     if parent_id:
         metadata["parents"] = [parent_id]
     data, content_type = _multipart_related(metadata, markdown.encode("utf-8"), "text/markdown")

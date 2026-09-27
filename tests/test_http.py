@@ -99,3 +99,49 @@ def test_gmail_headers_require_quota_project(monkeypatch: pytest.MonkeyPatch) ->
         http.gmail_headers()
     monkeypatch.setenv("GCLOUD_QUOTA_PROJECT", "proj")
     assert http.gmail_headers() == {"x-goog-user-project": "proj"}
+
+
+def test_network_error_on_retry(google: FakeGoogle) -> None:
+    google.queue(http_error(URL, 401), urllib.error.URLError("connection reset"))
+    with pytest.raises(WorkspaceError, match="Network error contacting Google: connection reset"):
+        http.request(URL, token_cache=auth.USER_TOKEN)
+
+
+def test_error_body_not_json_falls_back_to_reason(google: FakeGoogle) -> None:
+    import io
+    from email.message import Message
+
+    google.queue(urllib.error.HTTPError(URL, 502, "Bad Gateway", Message(), io.BytesIO(b"<html>")))
+    with pytest.raises(WorkspaceError, match=r"^Google API error 502: Bad Gateway$"):
+        http.request(URL, token_cache=auth.USER_TOKEN)
+
+
+def test_error_without_message_falls_back_to_reason(google: FakeGoogle) -> None:
+    google.queue(http_error(URL, 404, "", reason="Not Found"))
+    with pytest.raises(WorkspaceError, match=r"^Google API error 404: Not Found$"):
+        http.request(URL, token_cache=auth.USER_TOKEN)
+
+
+def test_extra_headers_and_content_type(google: FakeGoogle) -> None:
+    google.queue(FakeResponse(b"", "text/plain"))
+    body, content_type = http.request(
+        URL,
+        token_cache=auth.USER_TOKEN,
+        method="POST",
+        data=b"x",
+        content_type="text/plain",
+        extra_headers={"X-Test": "1"},
+    )
+    assert (body, content_type) == (b"", "text/plain")
+    req = google.requests[0]
+    assert req.get_header("X-test") == "1"
+    assert req.get_header("Content-type") == "text/plain"
+
+
+def test_send_json_empty_body(google: FakeGoogle) -> None:
+    google.queue(FakeResponse(b""))
+    assert http.send_json(URL, token_cache=auth.USER_TOKEN, data=b"{}") == {}
+
+
+def test_quote_escapes_path_separators() -> None:
+    assert http.quote("a/b?c#d") == "a%2Fb%3Fc%23d"

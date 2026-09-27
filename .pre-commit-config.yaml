@@ -1,14 +1,111 @@
+# Run `uv run pre-commit install` once; CI runs the same hooks on every push.
+default_install_hook_types: [pre-commit, commit-msg]
+
 repos:
+  # Generic file hygiene.
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
-      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: check-symlinks
       - id: check-toml
+      - id: check-yaml
+      - id: debug-statements
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: name-tests-test
+        args: [--pytest-test-first]
+        exclude: ^tests/conftest\.py$
+      - id: trailing-whitespace
+
+  # Python lint and formatting.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.9
+    rev: v0.16.9
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
+
+  # Packaging metadata and the lock file.
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: '0.26'
+    hooks:
+      - id: validate-pyproject
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.12.19
+    hooks:
+      - id: uv-lock
+
+  # Spelling in code and docs.
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.3
+    hooks:
+      - id: codespell
+        additional_dependencies: [tomli]
+        exclude: ^uv\.lock$
+
+  # YAML, Markdown, GitHub Actions and the Containerfile.
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        args: [--strict]
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.23.3
+    hooks:
+      - id: markdownlint-cli2
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.38.2
+    hooks:
+      - id: check-github-workflows
+  - repo: https://github.com/Mateusz-Grzelinski/actionlint-py
+    rev: v1.7.12.25
+    hooks:
+      - id: actionlint
+  - repo: https://github.com/AleksaC/hadolint-py
+    rev: v2.15.1
+    hooks:
+      - id: hadolint
+        files: (^|/)Containerfile$
+        types: [file]
+
+  # Secrets.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+
+  # Commits must carry a DCO sign-off.
+  - repo: local
+    hooks:
+      - id: signed-off-by
+        name: commit message has Signed-off-by
+        language: pygrep
+        entry: '^Signed-off-by: .+ <.+>$'
+        args: [--negate, --multiline]
+        stages: [commit-msg]
+
+  # Type checking and tests run in the project's own uv environment.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict, src)
+        language: system
+        entry: uv run --frozen mypy
+        types: [python]
+        pass_filenames: false
+      - id: pytest
+        name: pytest (100% line and branch coverage)
+        language: system
+        entry: uv run --frozen pytest -q --cov
+        types: [python]
+        pass_filenames: false

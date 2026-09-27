@@ -1,0 +1,5 @@
+config:
+  # Prose wraps at ~99 columns and tables hold long tool signatures.
+  MD013: false
+  # Tables stay compact instead of padded to align every pipe.
+  MD060: false

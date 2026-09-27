@@ -10,13 +10,20 @@ permissions:
   contents: read
 
 jobs:
-  lint:
+  pre-commit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # gitleaks scans the commit range, so it needs history.
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      # pytest runs across the Python matrix below.
+      - run: SKIP=pytest uv run pre-commit run --all-files --show-diff-on-failure
 
   test:
     runs-on: ubuntu-latest
@@ -29,7 +36,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: uv run pytest -v
+      - run: uv run pytest -v --cov
 
   container:
     runs-on: ubuntu-latest
@@ -40,8 +47,9 @@ jobs:
         run: podman run --rm --entrypoint gcloud gcloud-workspace-mcp version
       - name: server lists its tools over stdio
         run: |
+          init='{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}'
           printf '%s\n' \
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":$init}" \
             '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
             | timeout 60 podman run -i --rm gcloud-workspace-mcp \

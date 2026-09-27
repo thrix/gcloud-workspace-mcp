@@ -11,10 +11,16 @@ FROM registry.access.redhat.com/hi/python:${PYTHON_TAG}-builder AS build
 
 ARG GCLOUD_VERSION=583.0.0
 
+# The build stage runs as root to install packages; the runtime image runs as 65532.
+# hadolint ignore=DL3002
 USER 0
 
-# The Google Cloud SDK, without its bundled Python and the extra CLIs.
-RUN dnf install -y tar gzip findutils && dnf clean all \
+# The Google Cloud SDK, without its bundled Python and the extra CLIs. The
+# build tools come from the pinned builder image's repositories. Podman ignores
+# SHELL in OCI images, so pipefail is set inside the RUN (/bin/sh is bash here).
+# hadolint ignore=DL3041,DL4006,SC3040
+RUN set -o pipefail \
+    && dnf install -y tar gzip findutils && dnf clean all \
     && case "$(uname -m)" in \
         x86_64) arch=x86_64 ;; \
         aarch64) arch=arm ;; \
@@ -26,7 +32,8 @@ RUN dnf install -y tar gzip findutils && dnf clean all \
               /opt/google-cloud-sdk/platform/bq \
               /opt/google-cloud-sdk/platform/gsutil \
               /opt/google-cloud-sdk/bin/anthoscli \
-    && find /opt/google-cloud-sdk -name __pycache__ -type d -prune -exec rm -rf {} +
+    && find /opt/google-cloud-sdk -name __pycache__ -type d -prune -exec rm -rf {} + \
+    && mkdir /gcloud
 
 COPY . /src
 RUN python3 -m venv /opt/venv \
@@ -45,6 +52,8 @@ RUN printf '%s\n' \
 FROM registry.access.redhat.com/hi/python:${PYTHON_TAG}
 
 COPY --from=build /opt /opt
+# Mount point for the host's gcloud config; writable so gcloud works without one.
+COPY --from=build --chown=65532:65532 /gcloud /gcloud
 
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin \
     CLOUDSDK_CONFIG=/gcloud \

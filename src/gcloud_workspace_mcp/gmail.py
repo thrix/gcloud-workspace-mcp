@@ -83,18 +83,18 @@ def html_to_text(html: str) -> str:
     return parser.text()
 
 
-def _walk(part: dict) -> list[dict]:
+def _walk(part: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten a Gmail payload tree into a list of leaf parts."""
     children = part.get("parts") or []
     if not children:
         return [part]
-    leaves: list[dict] = []
+    leaves: list[dict[str, Any]] = []
     for child in children:
         leaves.extend(_walk(child))
     return leaves
 
 
-def _part_text(part: dict) -> str:
+def _part_text(part: dict[str, Any]) -> str:
     data = (part.get("body") or {}).get("data")
     if not data:
         return ""
@@ -102,7 +102,7 @@ def _part_text(part: dict) -> str:
     return text.replace("\r\n", "\n")
 
 
-def extract_body(payload: dict) -> str:
+def extract_body(payload: dict[str, Any]) -> str:
     """Return the message body as text: text/plain first, else stripped text/html."""
     leaves = [p for p in _walk(payload) if not p.get("filename")]
     for mime_type in ("text/plain", "text/html"):
@@ -119,7 +119,7 @@ def extract_body(payload: dict) -> str:
     return ""
 
 
-def simplify_message(message: dict) -> dict:
+def simplify_message(message: dict[str, Any]) -> dict[str, Any]:
     """Reduce a `format=full` Gmail message to headers, body and attachment names."""
     payload = message.get("payload") or {}
     headers = {
@@ -157,7 +157,7 @@ def _check_format(format: str) -> str:
     return "full" if format == "text" else format
 
 
-def _gmail_get(path: str, params: dict | list) -> Any:
+def _gmail_get(path: str, params: dict[str, Any] | list[tuple[str, str]]) -> Any:
     return get_json(
         f"{GMAIL_BASE}/users/me/{path}?{urllib.parse.urlencode(params)}",
         token_cache=ADC_TOKEN,
