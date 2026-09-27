@@ -20,6 +20,8 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 # ---------------------------------------------------------------------------
 # SECURITY — token handling rules (hard requirements, do not relax)
 # ---------------------------------------------------------------------------
@@ -41,8 +43,12 @@ REFRESH_SKEW_SECONDS = 5 * 60
 ASSUMED_TTL_SECONDS = 55 * 60
 
 
-class WorkspaceError(Exception):
-    """Raised for auth/HTTP failures; message is safe to surface (no token)."""
+class WorkspaceError(ToolError):
+    """Raised for auth/HTTP failures; message is safe to surface (no token).
+
+    Subclassing `ToolError` makes the MCP SDK hand the message to the client.
+    Any other exception reaches the client as a bare "Error executing tool".
+    """
 
 
 @dataclass

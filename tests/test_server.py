@@ -90,6 +90,46 @@ def test_token_never_in_errors(fn, code: int, google: FakeGoogle) -> None:
     assert SENTINEL_TOKEN not in repr(info.value)
 
 
+def _call(name: str, args: dict):
+    from mcp import Client
+
+    async def run():
+        async with Client(server.build_server(enable_writes=True)) as client:
+            return await client.call_tool(name, args)
+
+    return asyncio.run(run())
+
+
+def _text(result) -> str:
+    return "".join(getattr(part, "text", "") for part in result.content)
+
+
+def test_error_message_reaches_client(google: FakeGoogle) -> None:
+    google.queue(http_error("https://www.googleapis.com/x", 403, "insufficient scopes"))
+    result = _call("drive_search", {"query": "x"})
+    assert result.is_error
+    text = _text(result)
+    assert "insufficient scopes" in text
+    assert "wrong credential store" in text
+    assert SENTINEL_TOKEN not in text
+
+
+def test_missing_quota_project_reaches_client(
+    google: FakeGoogle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GCLOUD_QUOTA_PROJECT")
+    result = _call("gmail_search", {"query": "x"})
+    assert result.is_error
+    assert "GCLOUD_QUOTA_PROJECT is not set" in _text(result)
+
+
+def test_success_through_client(google: FakeGoogle) -> None:
+    google.queue_json({"files": [{"id": "a"}]})
+    result = _call("drive_search", {"query": "x"})
+    assert not result.is_error
+    assert json.loads(_text(result))["files"] == [{"id": "a"}]
+
+
 def test_tools_are_documented() -> None:
     for fn in ALL_TOOLS:
         doc = inspect.getdoc(fn) or ""

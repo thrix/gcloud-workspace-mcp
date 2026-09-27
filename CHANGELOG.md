@@ -13,3 +13,4 @@ First release.
 - Opt-in write tools behind `GCLOUD_WORKSPACE_ENABLE_WRITES=1`: `docs_create_from_markdown`,
   `docs_replace_content`, `docs_append_text`, `gmail_create_draft`.
 - Tokens only go to `https://*.googleapis.com`. The server refuses any other URL.
+- `Containerfile` with the Google Cloud SDK on a distroless Hummingbird Python image.

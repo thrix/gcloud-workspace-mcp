@@ -80,6 +80,27 @@ For another client, add this to its MCP config:
 
 Pin a release by appending `@v0.1.0` to the git URL.
 
+### Container
+
+The [`Containerfile`](Containerfile) builds the server with the Google Cloud SDK on a distroless
+[Hummingbird](https://gitlab.com/redhat/hummingbird/containers) Python image. You still do the one-time
+`gcloud` logins on your host. The container reads and refreshes the tokens through a mount of
+your gcloud config directory.
+
+```bash
+podman build -t gcloud-workspace-mcp .
+
+claude mcp add -s user gcloud-workspace -- \
+  podman run -i --rm --userns=keep-id:uid=65532,gid=65532 \
+    -v "$HOME/.config/gcloud:/gcloud:z" \
+    -e GCLOUD_QUOTA_PROJECT=<your-quota-project> \
+    gcloud-workspace-mcp
+```
+
+`--userns=keep-id` maps your host user to the image's UID 65532, so gcloud can write refreshed
+tokens back to your config. Pass `-e GCLOUD_WORKSPACE_ENABLE_WRITES=1` to enable the write tools.
+Build with `--build-arg GCLOUD_VERSION=<version>` to pick a different SDK release.
+
 ### Environment
 
 | Variable                         | Meaning                                                  |
