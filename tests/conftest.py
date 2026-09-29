@@ -9,11 +9,12 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from email.message import Message
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from gcloud_workspace_mcp import auth
+from gcloud_workspace_mcp import auth, http
 
 # A recognizable token; tests assert it never shows up in any output.
 SENTINEL_TOKEN = "ya29.SENTINEL-TOKEN-must-never-leak"
@@ -28,8 +29,8 @@ class FakeResponse:
         self.headers = Message()
         self.headers["Content-Type"] = self.content_type
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, amt: int | None = None) -> bytes:
+        return self.body if amt is None else self.body[:amt]
 
     def __enter__(self) -> FakeResponse:
         return self
@@ -39,9 +40,10 @@ class FakeResponse:
 
 
 def http_error(
-    url: str, code: int, message: str = "", reason: str = "err"
+    url: str, code: int, message: str = "", reason: str = "err", **error: Any
 ) -> urllib.error.HTTPError:
-    body = json.dumps({"error": {"code": code, "message": message}}).encode()
+    """Build an HTTPError; extra keywords (`errors`, `details`) go into the error body."""
+    body = json.dumps({"error": {"code": code, "message": message, **error}}).encode()
     return urllib.error.HTTPError(url, code, reason, Message(), io.BytesIO(body))
 
 
@@ -76,11 +78,13 @@ class FakeGcloud:
 
     tokens: list[str] = field(default_factory=lambda: [SENTINEL_TOKEN])
     calls: list[list[str]] = field(default_factory=list)
+    kwargs: list[dict[str, Any]] = field(default_factory=list)
     returncode: int = 0
     stderr: str = ""
 
     def run(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         self.calls.append(list(cmd))
+        self.kwargs.append(kwargs)
         token = self.tokens[min(len(self.calls) - 1, len(self.tokens) - 1)]
         return subprocess.CompletedProcess(cmd, self.returncode, token + "\n", self.stderr)
 
@@ -102,9 +106,17 @@ def gcloud(monkeypatch: pytest.MonkeyPatch) -> FakeGcloud:
 @pytest.fixture
 def google(monkeypatch: pytest.MonkeyPatch, gcloud: FakeGcloud) -> FakeGoogle:
     fake = FakeGoogle()
-    monkeypatch.setattr(urllib.request, "urlopen", fake.urlopen)
+    monkeypatch.setattr(http._OPENER, "open", fake.urlopen)
     monkeypatch.setenv("GCLOUD_QUOTA_PROJECT", "test-quota-project")
     return fake
+
+
+@pytest.fixture(autouse=True)
+def download_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Keep binary downloads out of the real cache directory."""
+    target = tmp_path / "downloads"
+    monkeypatch.setenv("GCLOUD_WORKSPACE_DOWNLOAD_DIR", str(target))
+    return target
 
 
 @pytest.fixture(autouse=True)
@@ -113,3 +125,4 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("tests must not touch the network")
 
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", refuse)

@@ -3,21 +3,40 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import json
 import re
 import urllib.parse
-from email.message import EmailMessage
+from email.message import EmailMessage, Message
 from html.parser import HTMLParser
 from typing import Any, ClassVar
 
 from .auth import ADC_TOKEN, WorkspaceError
-from .http import GMAIL_BASE, get_json, gmail_headers, quote, send_json
+from .downloads import MAX_DOWNLOAD_BYTES, save_file
+from .http import (
+    GMAIL_BASE,
+    ResponseTooLarge,
+    get_json,
+    gmail_headers,
+    resource_id,
+    send_json,
+)
 
 # Headers kept by the "text" format.
 TEXT_HEADERS = ("From", "To", "Cc", "Date", "Subject")
+# Gmail keeps the sender's spelling of a header name, and Outlook writes "CC".
+_TEXT_HEADER_NAMES = {name.lower(): name for name in TEXT_HEADERS}
 
 # Bodies longer than this are cut, so one newsletter can't flood the context.
 MAX_BODY_CHARS = 50_000
+# A "text" thread keeps bodies, newest first, up to this many characters in total.
+MAX_THREAD_CHARS = 100_000
+# The Gmail resource formats return base64 bodies, so their responses are
+# capped. Claude Code saves a text result over its own limit to a file.
+MAX_RESOURCE_BYTES = 1024 * 1024
+# `raw` carries every attachment. The server decodes it to an .eml file
+# instead of returning base64, so it may be as large as any download.
+MAX_RAW_BYTES = MAX_DOWNLOAD_BYTES
 
 _RAW_FORMATS = {"metadata", "minimal", "full", "raw"}
 _ALL_FORMATS = _RAW_FORMATS | {"text"}
@@ -48,23 +67,48 @@ class _HTMLText(HTMLParser):
         "table",
     }
     _SKIP: ClassVar[set[str]] = {"script", "style", "head", "title"}
+    _CELL: ClassVar[set[str]] = {"td", "th"}
+    # Link targets worth keeping; `#anchors` and `javascript:` are noise.
+    _LINK_SCHEMES = ("http://", "https://", "mailto:")
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._parts: list[str] = []
         self._skip_depth = 0
+        # (href, index into `_parts` where the link text starts) per open <a>.
+        self._links: list[tuple[str, int]] = []
 
-    def handle_starttag(self, tag: str, attrs: Any) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in self._SKIP:
             self._skip_depth += 1
         elif tag in self._BLOCK:
             self._parts.append("\n")
+        elif tag == "a":
+            href = (dict(attrs).get("href") or "").strip()
+            self._links.append((href, len(self._parts)))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        # `<br/>` is one break. The default handler would also run
+        # `handle_endtag` and add a second one.
+        self.handle_starttag(tag, attrs)
+        if tag not in self._BLOCK:
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self._SKIP and self._skip_depth:
             self._skip_depth -= 1
         elif tag in self._BLOCK:
             self._parts.append("\n")
+        elif tag in self._CELL:
+            # Collapsed to one space by `text()`, so adjacent cells stay apart.
+            self._parts.append("\t")
+        elif tag == "a" and self._links:
+            href, start = self._links.pop()
+            label = "".join(self._parts[start:]).strip()
+            # A mailto: link labelled with its own address adds nothing.
+            same = href.removeprefix("mailto:") == label
+            if href.lower().startswith(self._LINK_SCHEMES) and not same and not self._skip_depth:
+                self._parts.append(f" <{href}>")
 
     def handle_data(self, data: str) -> None:
         if not self._skip_depth:
@@ -94,11 +138,26 @@ def _walk(part: dict[str, Any]) -> list[dict[str, Any]]:
     return leaves
 
 
+def _charset(part: dict[str, Any]) -> str:
+    """Return the part's declared charset, or utf-8 when it names none we know."""
+    header = Message()
+    for h in part.get("headers") or []:
+        if h.get("name", "").lower() == "content-type":
+            header["Content-Type"] = h.get("value", "")
+    charset = header.get_content_charset() or "utf-8"
+    try:
+        codecs.lookup(charset)
+    except LookupError:
+        return "utf-8"
+    return charset
+
+
 def _part_text(part: dict[str, Any]) -> str:
     data = (part.get("body") or {}).get("data")
     if not data:
         return ""
-    text = _b64url_decode(data).decode("utf-8", "replace")
+    # Gmail returns the part's bytes in the sender's charset, not in UTF-8.
+    text = _b64url_decode(data).decode(_charset(part), "replace")
     return text.replace("\r\n", "\n")
 
 
@@ -123,7 +182,9 @@ def simplify_message(message: dict[str, Any]) -> dict[str, Any]:
     """Reduce a `format=full` Gmail message to headers, body and attachment names."""
     payload = message.get("payload") or {}
     headers = {
-        h["name"]: h["value"] for h in payload.get("headers", []) if h.get("name") in TEXT_HEADERS
+        _TEXT_HEADER_NAMES[name]: h["value"]
+        for h in payload.get("headers", [])
+        if (name := (h.get("name") or "").lower()) in _TEXT_HEADER_NAMES
     }
     attachments = [
         {
@@ -146,6 +207,22 @@ def simplify_message(message: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _trim_thread(messages: list[dict[str, Any]]) -> list[str]:
+    """Drop the oldest bodies once a thread passes ``MAX_THREAD_CHARS``.
+
+    Replies quote older mail, so the newest messages keep their bodies. Returns
+    the ids of the messages whose body was dropped, oldest first.
+    """
+    remaining = MAX_THREAD_CHARS
+    omitted: list[str] = []
+    for message in reversed(messages):
+        remaining -= len(message["body"])
+        if remaining < 0:
+            message["body"] = None
+            omitted.append(message["id"])
+    return omitted[::-1]
+
+
 # ---------------------------------- reads ----------------------------------
 
 
@@ -157,12 +234,30 @@ def _check_format(format: str) -> str:
     return "full" if format == "text" else format
 
 
-def _gmail_get(path: str, params: dict[str, Any] | list[tuple[str, str]]) -> Any:
+def _gmail_get(
+    path: str,
+    params: dict[str, Any] | list[tuple[str, str]],
+    max_bytes: int | None = None,
+) -> Any:
     return get_json(
         f"{GMAIL_BASE}/users/me/{path}?{urllib.parse.urlencode(params)}",
         token_cache=ADC_TOKEN,
         extra_headers=gmail_headers(),
+        max_bytes=max_bytes,
     )
+
+
+def _get_resource(path: str, format: str) -> Any:
+    """Fetch a message or thread; the resource formats are size-capped."""
+    api_format = _check_format(format)
+    if format == "text":
+        # `text` keeps only the decoded body, which `extract_body` truncates.
+        return _gmail_get(path, {"format": api_format})
+    max_bytes = MAX_RAW_BYTES if format == "raw" else MAX_RESOURCE_BYTES
+    try:
+        return _gmail_get(path, {"format": api_format}, max_bytes=max_bytes)
+    except ResponseTooLarge as exc:
+        raise WorkspaceError(f"{exc} Use format='text' for the decoded body.") from None
 
 
 def gmail_search(query: str, max_results: int = 20, page_token: str = "") -> str:
@@ -205,16 +300,23 @@ def gmail_get_message(message_id: str, format: str = "text") -> str:
         message_id: The Gmail message id.
         format: "text" (default) returns `{id, threadId, labelIds, headers, body,
             attachments}` with the body decoded to plain text (HTML-only mail is
-            stripped of tags). "metadata", "minimal", "full" and "raw" return the
-            Gmail message resource unchanged.
+            stripped of tags). "metadata", "minimal" and "full" return the
+            Gmail message resource unchanged, up to 1 MB. "raw" saves the whole
+            RFC 822 message, attachments included, to `<message id>.eml` in the
+            download directory, and returns the resource with `path`,
+            `mimeType` and `bytes` in place of the base64 `raw` field.
 
     Returns:
         The message as JSON.
     """
-    api_format = _check_format(format)
-    data = _gmail_get(f"messages/{quote(message_id)}", {"format": api_format})
+    message_id = resource_id(message_id, name="message_id")
+    data = _get_resource(f"messages/{message_id}", format)
     if format == "text":
         data = simplify_message(data)
+    elif format == "raw":
+        body = _b64url_decode(data.pop("raw", ""))
+        path = save_file(f"{message_id}.eml", body)
+        data.update(path=str(path), mimeType="message/rfc822", bytes=len(body))
     return json.dumps(data, indent=2)
 
 
@@ -225,20 +327,28 @@ def gmail_get_thread(thread_id: str, format: str = "text") -> str:
 
     Args:
         thread_id: The Gmail thread id (the `threadId` of any of its messages).
-        format: "text" (default) decodes every message like `gmail_get_message`;
-            "metadata", "minimal" and "full" return the raw Gmail resources.
+        format: "text" (default) decodes every message like `gmail_get_message`.
+            The bodies share a 100,000-character budget, newest message first;
+            older messages past it keep their headers, get `body: null`, and
+            their ids are listed in `omittedBodies` for `gmail_get_message`.
+            "metadata", "minimal" and "full" return the raw Gmail resources,
+            up to 1 MB for the whole thread.
 
     Returns:
-        A JSON object `{id, messages: [...]}`.
+        A JSON object `{id, messages: [...]}`, plus `omittedBodies` when the
+        "text" format dropped any body.
     """
     if format == "raw":
         raise WorkspaceError("format 'raw' is not supported for threads.")
-    api_format = _check_format(format)
-    data = _gmail_get(f"threads/{quote(thread_id)}", {"format": api_format})
+    data = _get_resource(f"threads/{resource_id(thread_id, name='thread_id')}", format)
     messages = data.get("messages", [])
+    result: dict[str, Any] = {"id": data.get("id")}
     if format == "text":
         messages = [simplify_message(m) for m in messages]
-    return json.dumps({"id": data.get("id"), "messages": messages}, indent=2)
+        if omitted := _trim_thread(messages):
+            result["omittedBodies"] = omitted
+    result["messages"] = messages
+    return json.dumps(result, indent=2)
 
 
 # ---------------------------------- writes ---------------------------------
@@ -249,8 +359,9 @@ def _reply_headers(thread_id: str) -> dict[str, str]:
     params = [("format", "metadata")] + [
         ("metadataHeaders", name) for name in ("Message-ID", "References")
     ]
-    thread = _gmail_get(f"threads/{quote(thread_id)}", params)
-    messages = thread.get("messages") or []
+    thread = _gmail_get(f"threads/{resource_id(thread_id, name='thread_id')}", params)
+    # A thread lists unsent drafts too; their Message-ID never reached anyone.
+    messages = [m for m in thread.get("messages") or [] if "DRAFT" not in m.get("labelIds", [])]
     if not messages:
         return {}
     headers = {

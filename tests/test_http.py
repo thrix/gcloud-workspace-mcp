@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import urllib.error
+import urllib.request
 
 import pytest
 from conftest import SENTINEL_TOKEN, FakeGcloud, FakeGoogle, FakeResponse, http_error
@@ -9,6 +10,7 @@ from gcloud_workspace_mcp import auth, http
 from gcloud_workspace_mcp.auth import WorkspaceError
 
 URL = "https://www.googleapis.com/drive/v3/files"
+QUOTA = {"x-goog-user-project": "test-quota-project"}
 
 
 def test_attaches_bearer_token(google: FakeGoogle) -> None:
@@ -68,8 +70,17 @@ def test_second_401_is_an_error(google: FakeGoogle) -> None:
 
 def test_403_quota_hint(google: FakeGoogle) -> None:
     google.queue(http_error(URL, 403, "Gmail API has not been used ... accessNotConfigured"))
-    with pytest.raises(WorkspaceError, match="GCLOUD_QUOTA_PROJECT"):
+    with pytest.raises(WorkspaceError, match="enable the API in the GCLOUD_QUOTA_PROJECT"):
+        http.request(URL, token_cache=auth.ADC_TOKEN, extra_headers=QUOTA)
+
+
+def test_403_disabled_api_without_quota_header(google: FakeGoogle) -> None:
+    google.queue(
+        http_error(URL, 403, "Docs API ... disabled", errors=[{"reason": "SERVICE_DISABLED"}])
+    )
+    with pytest.raises(WorkspaceError, match="GCLOUD_QUOTA_PROJECT does not apply") as info:
         http.request(URL, token_cache=auth.USER_TOKEN)
+    assert "set-quota-project" not in str(info.value)
 
 
 def test_403_store_hint(google: FakeGoogle) -> None:
@@ -143,5 +154,102 @@ def test_send_json_empty_body(google: FakeGoogle) -> None:
     assert http.send_json(URL, token_cache=auth.USER_TOKEN, data=b"{}") == {}
 
 
-def test_quote_escapes_path_separators() -> None:
-    assert http.quote("a/b?c#d") == "a%2Fb%3Fc%23d"
+@pytest.mark.parametrize("value", ["1AbC-_x9", "18c2f3a4b5d6e7f8"])
+def test_resource_id_accepts_ids(value: str) -> None:
+    assert http.resource_id(value) == value
+
+
+@pytest.mark.parametrize("value", ["", ".", "..", "a/b", "a?b", "a#b", "a%2Fb", "a b", "a\n"])
+def test_resource_id_refuses_other_values(value: str) -> None:
+    with pytest.raises(WorkspaceError, match=r"file_id .* is not a valid id"):
+        http.resource_id(value, name="file_id")
+
+
+def _redirect(new_url: str) -> urllib.request.Request | None:
+    import io
+    from email.message import Message
+
+    req = urllib.request.Request(URL)
+    req.add_header("Authorization", f"Bearer {SENTINEL_TOKEN}")
+    handler = http._GuardedRedirectHandler()
+    return handler.redirect_request(req, io.BytesIO(), 302, "Found", Message(), new_url)
+
+
+@pytest.mark.parametrize(
+    "url", ["https://evil.example.com/x", "http://www.googleapis.com/drive/v3/files"]
+)
+def test_redirect_to_non_google_is_refused(url: str) -> None:
+    with pytest.raises(WorkspaceError, match="Refusing to send credentials"):
+        _redirect(url)
+
+
+def test_redirect_to_google_is_followed() -> None:
+    new = _redirect("https://www.googleapis.com/drive/v3/files/moved")
+    assert new is not None
+    assert new.full_url == "https://www.googleapis.com/drive/v3/files/moved"
+
+
+def test_opener_uses_guarded_redirects() -> None:
+    assert any(isinstance(h, http._GuardedRedirectHandler) for h in http._OPENER.handlers)
+
+
+def test_request_passes_timeout(google: FakeGoogle, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+
+    def urlopen(req: urllib.request.Request, *args: object, **kwargs: object) -> FakeResponse:
+        seen.append(kwargs.get("timeout"))
+        return FakeResponse(b"{}")
+
+    monkeypatch.setattr(http._OPENER, "open", urlopen)
+    http.request(URL, token_cache=auth.USER_TOKEN)
+    assert seen == [http.REQUEST_TIMEOUT_SECONDS]
+
+
+def test_timeout_is_reported(google: FakeGoogle) -> None:
+    google.queue(TimeoutError("timed out"))
+    with pytest.raises(WorkspaceError, match="did not respond within 60 seconds"):
+        http.request(URL, token_cache=auth.USER_TOKEN)
+
+
+def test_max_bytes(google: FakeGoogle) -> None:
+    google.queue(FakeResponse(b"12345"), FakeResponse(b"123456"))
+    assert http.request(URL, token_cache=auth.USER_TOKEN, max_bytes=5)[0] == b"12345"
+    with pytest.raises(WorkspaceError, match="over the 5-byte limit"):
+        http.request(URL, token_cache=auth.USER_TOKEN, max_bytes=5)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"errors": [{"domain": "usageLimits", "reason": "accessNotConfigured"}]},
+        {
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "SERVICE_DISABLED"}
+            ]
+        },
+    ],
+)
+def test_403_quota_hint_from_reason(google: FakeGoogle, error: dict[str, object]) -> None:
+    message = "Gmail API has not been used in project 123 before or it is disabled."
+    google.queue(http_error(URL, 403, message, **error))
+    with pytest.raises(WorkspaceError, match="enable the API in the GCLOUD_QUOTA_PROJECT"):
+        http.request(URL, token_cache=auth.ADC_TOKEN, extra_headers=QUOTA)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [ConnectionResetError("reset by peer"), http.HTTPException("truncated")],
+)
+def test_read_errors_are_reported(google: FakeGoogle, exc: Exception) -> None:
+    google.queue(exc)
+    with pytest.raises(WorkspaceError, match="Network error contacting Google") as info:
+        http.request(URL, token_cache=auth.USER_TOKEN)
+    assert SENTINEL_TOKEN not in str(info.value)
+
+
+@pytest.mark.parametrize("call", [http.get_json, http.send_json])
+def test_non_json_body_is_reported(google: FakeGoogle, call: object) -> None:
+    google.queue(FakeResponse(b"<html>portal</html>", "text/html"))
+    kwargs = {"data": b"{}"} if call is http.send_json else {}
+    with pytest.raises(WorkspaceError, match="not JSON"):
+        call(URL, token_cache=auth.USER_TOKEN, **kwargs)  # type: ignore[operator]

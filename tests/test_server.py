@@ -72,6 +72,8 @@ _GENERIC = {"id": "x", "files": [], "messages": [], "message": {}, "documentId":
 def test_token_never_in_success_output(fn, google: FakeGoogle) -> None:
     if fn is drive.drive_download:
         google.queue_json({"id": "f", "name": "a", "mimeType": "application/pdf", "size": "1"})
+    if fn is drive.docs_replace_content:
+        google.queue_json({"id": "f", "name": "a", "mimeType": drive.GOOGLE_DOC_MIME})
     google.queue(*[FakeResponse(json.dumps(_GENERIC).encode()) for _ in range(3)])
     out = fn(**_ARGS[fn.__name__])
     assert SENTINEL_TOKEN not in out

@@ -2,25 +2,41 @@
 
 from __future__ import annotations
 
-import base64
 import json
+import mimetypes
+import re
 import urllib.parse
 import uuid
+from pathlib import Path
 from typing import Any
 
 from .auth import USER_TOKEN, WorkspaceError
-from .http import DOCS_BASE, DRIVE_BASE, DRIVE_UPLOAD_BASE, get_json, quote, request, send_json
+from .downloads import MAX_DOWNLOAD_BYTES, save_file
+from .http import (
+    DOCS_BASE,
+    DRIVE_BASE,
+    DRIVE_UPLOAD_BASE,
+    get_json,
+    request,
+    resource_id,
+    send_json,
+)
 
-# Export MIME types Google Docs can be exported to via the Drive API.
+# Export MIME types for Google-native files. Docs take all but text/csv,
+# Sheets take only text/csv (first sheet) and PDF, Slides take text/plain and PDF.
 ALLOWED_EXPORT_TYPES = {
     "text/markdown",
     "text/plain",
     "text/html",
+    "text/csv",
     "application/pdf",
 }
 
-# Refuse to download files larger than this; the whole body goes to the client.
-MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
+# Text goes to the client in windows of this many characters; `offset` picks one.
+MAX_TEXT_CHARS = 50_000
+
+# A file-name suffix from Drive is kept only when it looks like an extension.
+_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,10}")
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 
@@ -38,9 +54,36 @@ def _is_text(mime_type: str) -> bool:
     return mime_type.startswith("text/") or mime_type in _TEXT_MIME_TYPES
 
 
-def _binary_blob(mime_type: str, body: bytes) -> str:
-    encoded = base64.b64encode(body).decode("ascii")
-    return f"[binary {mime_type}, base64-encoded below; {len(body)} bytes]\n{encoded}"
+def _save_binary(file_id: str, mime_type: str, body: bytes, name: str = "") -> str:
+    """Save ``body`` under the download directory and describe the file as JSON.
+
+    The file name is the Drive id plus an extension, so a file name chosen by
+    whoever shared the file never becomes part of a local path.
+    """
+    suffix = mimetypes.guess_extension(mime_type) or ""
+    if not suffix and _SUFFIX.fullmatch(Path(name).suffix):
+        suffix = Path(name).suffix
+    path = save_file(f"{file_id}{suffix}", body)
+    return json.dumps(
+        {"path": str(path), "name": name or None, "mimeType": mime_type, "bytes": len(body)},
+        indent=2,
+    )
+
+
+def _text_window(body: bytes, offset: int) -> str:
+    """Decode ``body`` and return ``MAX_TEXT_CHARS`` characters from ``offset``."""
+    text = body.decode("utf-8", "replace")
+    offset = max(0, int(offset))
+    if offset >= len(text) > 0:
+        raise WorkspaceError(f"offset {offset} is past the end ({len(text)} chars).")
+    end = offset + MAX_TEXT_CHARS
+    window = text[offset:end]
+    if end < len(text):
+        window += (
+            f"\n[... truncated: chars {offset}-{end} of {len(text)}; "
+            f"call again with offset={end} for more]"
+        )
+    return window
 
 
 # ---------------------------------- reads ----------------------------------
@@ -49,8 +92,8 @@ def _binary_blob(mime_type: str, body: bytes) -> str:
 def drive_search(query: str, page_size: int = 20, page_token: str = "") -> str:
     """Search Google Drive files using a raw Drive `q` query string.
 
-    Uses *user* credentials (`gcloud auth print-access-token`). Searches shared
-    drives too.
+    Uses *user* credentials (`gcloud auth print-access-token`). Searches My
+    Drive, files shared with you, and every shared drive you belong to.
 
     Args:
         query: A raw Drive v3 `q` expression, e.g.
@@ -60,13 +103,18 @@ def drive_search(query: str, page_size: int = 20, page_token: str = "") -> str:
         page_token: The `nextPageToken` from a previous call, to fetch the next page.
 
     Returns:
-        A JSON object `{files: [{id, name, mimeType, modifiedTime}], nextPageToken}`.
-        `nextPageToken` is null on the last page.
+        A JSON object `{files: [{id, name, mimeType, modifiedTime}], nextPageToken,
+        incompleteSearch}`. `nextPageToken` is null on the last page.
+        `incompleteSearch` is true when Drive skipped some shared drives; narrow
+        the query and search again.
     """
     params = {
         "q": query,
         "pageSize": max(1, min(int(page_size), 100)),
-        "fields": "nextPageToken,files(id,name,mimeType,modifiedTime)",
+        "fields": "nextPageToken,incompleteSearch,files(id,name,mimeType,modifiedTime)",
+        # The default `user` corpus holds only files you created, opened or got
+        # shared directly, so shared-drive files you never touched would be missing.
+        "corpora": "allDrives",
         "supportsAllDrives": "true",
         "includeItemsFromAllDrives": "true",
     }
@@ -74,7 +122,11 @@ def drive_search(query: str, page_size: int = 20, page_token: str = "") -> str:
         params["pageToken"] = page_token
     data = get_json(f"{DRIVE_BASE}/files?{urllib.parse.urlencode(params)}", token_cache=USER_TOKEN)
     return json.dumps(
-        {"files": data.get("files", []), "nextPageToken": data.get("nextPageToken")},
+        {
+            "files": data.get("files", []),
+            "nextPageToken": data.get("nextPageToken"),
+            "incompleteSearch": data.get("incompleteSearch", False),
+        },
         indent=2,
     )
 
@@ -82,7 +134,8 @@ def drive_search(query: str, page_size: int = 20, page_token: str = "") -> str:
 def _metadata(file_id: str, fields: str) -> dict[str, Any]:
     params = urllib.parse.urlencode({"fields": fields, "supportsAllDrives": "true"})
     data: dict[str, Any] = get_json(
-        f"{DRIVE_BASE}/files/{quote(file_id)}?{params}", token_cache=USER_TOKEN
+        f"{DRIVE_BASE}/files/{resource_id(file_id, name='file_id')}?{params}",
+        token_cache=USER_TOKEN,
     )
     return data
 
@@ -105,12 +158,16 @@ def drive_get_metadata(file_id: str) -> str:
     return json.dumps(_metadata(file_id, fields), indent=2)
 
 
-def docs_export(file_id: str, mime_type: str = "text/markdown") -> str:
+def docs_export(file_id: str, mime_type: str = "text/markdown", offset: int = 0) -> str:
     """Export a Google Doc (or other Google-native file) to text.
 
     Uses *user* credentials. Allowed export types: text/markdown, text/plain,
-    text/html, application/pdf. PDF is binary and is returned base64-encoded
-    with a note. The Drive API refuses exports larger than 10 MB.
+    text/html, text/csv, application/pdf. Docs export to all but text/csv.
+    Sheets export to text/csv (first sheet only) or PDF, and Slides to
+    text/plain or PDF. A PDF is saved to a local file, and the result gives
+    its path; open that file to read it. Text comes back 50,000 characters
+    at a time; a note at the end gives the `offset` of the next window. The
+    Drive API refuses exports larger than 10 MB.
 
     For files that are not Google-native (uploaded PDFs, xlsx, txt, ...) use
     `drive_download` instead.
@@ -118,9 +175,11 @@ def docs_export(file_id: str, mime_type: str = "text/markdown") -> str:
     Args:
         file_id: The Drive file id of a Google-native document.
         mime_type: Target export MIME type (see allowed list above).
+        offset: Character offset to start the text from. Ignored for PDF.
 
     Returns:
-        The exported document as text, or a base64 blob for PDF.
+        The exported document as text, or for PDF a JSON object
+        `{path, name, mimeType, bytes}` describing the saved file.
     """
     if mime_type not in ALLOWED_EXPORT_TYPES:
         raise WorkspaceError(
@@ -129,27 +188,33 @@ def docs_export(file_id: str, mime_type: str = "text/markdown") -> str:
         )
     params = urllib.parse.urlencode({"mimeType": mime_type})
     body, _ = request(
-        f"{DRIVE_BASE}/files/{quote(file_id)}/export?{params}", token_cache=USER_TOKEN
+        f"{DRIVE_BASE}/files/{resource_id(file_id, name='file_id')}/export?{params}",
+        token_cache=USER_TOKEN,
+        max_bytes=MAX_DOWNLOAD_BYTES,
     )
     if mime_type == "application/pdf":
-        return _binary_blob(mime_type, body)
-    return body.decode("utf-8", "replace")
+        return _save_binary(file_id, mime_type, body)
+    return _text_window(body, offset)
 
 
-def drive_download(file_id: str) -> str:
+def drive_download(file_id: str, offset: int = 0) -> str:
     """Download the content of a non-Google-native Drive file.
 
     Uses *user* credentials. Works for uploaded files such as PDF, xlsx, txt or
-    images. Text types are returned as text; anything else is returned
-    base64-encoded with a note. Files over 10 MB are refused.
+    images, up to 10 MB. Text files come back 50,000 characters at a time; a
+    note at the end gives the `offset` of the next window. Anything else is
+    saved to a local file, and the result gives its path; open that file to
+    read it.
 
     For Google Docs, Sheets and Slides use `docs_export` instead.
 
     Args:
         file_id: The Drive file id.
+        offset: Character offset to start the text from. Ignored for binary files.
 
     Returns:
-        The file content as text, or a base64 blob for binary files.
+        The file content as text, or for binary files a JSON object
+        `{path, name, mimeType, bytes}` describing the saved file.
     """
     meta = _metadata(file_id, "id,name,mimeType,size")
     mime_type = meta.get("mimeType", "application/octet-stream")
@@ -158,16 +223,22 @@ def drive_download(file_id: str) -> str:
             f"{meta.get('name', file_id)!r} is a Google-native file ({mime_type}); "
             "use docs_export instead."
         )
+    is_text = _is_text(mime_type)
     size = int(meta.get("size") or 0)
     if size > MAX_DOWNLOAD_BYTES:
         raise WorkspaceError(
             f"File is {size} bytes, over the {MAX_DOWNLOAD_BYTES}-byte download limit."
         )
     params = urllib.parse.urlencode({"alt": "media", "supportsAllDrives": "true"})
-    body, _ = request(f"{DRIVE_BASE}/files/{quote(file_id)}?{params}", token_cache=USER_TOKEN)
-    if _is_text(mime_type):
-        return body.decode("utf-8", "replace")
-    return _binary_blob(mime_type, body)
+    # `size` can be missing from the metadata, so the body is capped as well.
+    body, _ = request(
+        f"{DRIVE_BASE}/files/{resource_id(file_id, name='file_id')}?{params}",
+        token_cache=USER_TOKEN,
+        max_bytes=MAX_DOWNLOAD_BYTES,
+    )
+    if is_text:
+        return _text_window(body, offset)
+    return _save_binary(file_id, mime_type, body, meta.get("name", ""))
 
 
 # ---------------------------------- writes ---------------------------------
@@ -223,8 +294,9 @@ def docs_create_from_markdown(title: str, markdown: str, parent_id: str = "") ->
 def docs_replace_content(file_id: str, markdown: str) -> str:
     """Replace the whole content of an existing Google Doc with markdown.
 
-    Uses *user* credentials. The previous content stays reachable through the
-    document's version history in the Drive UI.
+    Uses *user* credentials. Only native Google Docs are accepted. Their
+    previous content stays reachable through the version history in the Drive
+    UI; Drive purges old revisions of uploaded files, so those are refused.
 
     Args:
         file_id: The Drive file id of an existing Google Doc.
@@ -233,11 +305,18 @@ def docs_replace_content(file_id: str, markdown: str) -> str:
     Returns:
         A JSON object `{id, name, modifiedTime}`.
     """
+    meta = _metadata(file_id, "id,name,mimeType")
+    mime_type = meta.get("mimeType")
+    if mime_type != GOOGLE_DOC_MIME:
+        raise WorkspaceError(
+            f"{meta.get('name', file_id)!r} is {mime_type}, not a Google Doc; "
+            "docs_replace_content only overwrites Google Docs."
+        )
     params = urllib.parse.urlencode(
         {"uploadType": "media", "supportsAllDrives": "true", "fields": "id,name,modifiedTime"}
     )
     result = send_json(
-        f"{DRIVE_UPLOAD_BASE}/files/{quote(file_id)}?{params}",
+        f"{DRIVE_UPLOAD_BASE}/files/{resource_id(file_id, name='file_id')}?{params}",
         token_cache=USER_TOKEN,
         method="PATCH",
         data=markdown.encode("utf-8"),
@@ -261,7 +340,7 @@ def docs_append_text(file_id: str, text: str) -> str:
     """
     payload = {"requests": [{"insertText": {"endOfSegmentLocation": {}, "text": text}}]}
     result = send_json(
-        f"{DOCS_BASE}/documents/{quote(file_id)}:batchUpdate",
+        f"{DOCS_BASE}/documents/{resource_id(file_id, name='file_id')}:batchUpdate",
         token_cache=USER_TOKEN,
         data=json.dumps(payload).encode("utf-8"),
     )

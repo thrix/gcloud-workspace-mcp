@@ -38,7 +38,7 @@ container image for amd64 and arm64. Pushes to `main` and `v*` tags publish the 
 ## Rules
 
 - Tests must not touch the network or a real `gcloud`. Use the fakes in `tests/conftest.py`,
-  which patch `subprocess.run` and `urllib.request.urlopen`. `tests/test_stdio.py` starts
+  which patch `subprocess.run` and the opener in `gcloud_workspace_mcp.http`. `tests/test_stdio.py` starts
   the real server process with a fake `gcloud` on `PATH`.
 - Keep the HTTP layer on the standard library. A new dependency needs a strong reason.
 - Follow the token rules at the top of `src/gcloud_workspace_mcp/auth.py`. A change that sends a

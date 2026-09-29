@@ -41,6 +41,8 @@ REFRESH_SKEW_SECONDS = 5 * 60
 # gcloud access tokens last ~1h; `print-access-token` does not reliably report
 # the expiry, so we assume a conservative lifetime and refresh early.
 ASSUMED_TTL_SECONDS = 55 * 60
+# Give up on a gcloud call that hangs, for example on a reauth prompt.
+GCLOUD_TIMEOUT_SECONDS = 60
 
 
 class WorkspaceError(ToolError):
@@ -80,15 +82,25 @@ class TokenCache:
         try:
             proc = subprocess.run(  # noqa: S603 — fixed argv, no user input
                 self.command,
+                # The server's stdin is the MCP transport. A gcloud prompt must
+                # not read protocol messages from it.
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=GCLOUD_TIMEOUT_SECONDS,
             )
         except FileNotFoundError as exc:
             raise WorkspaceError(
                 "`gcloud` CLI not found on PATH. Install the Google Cloud SDK "
                 "and authenticate (see the README)."
             ) from exc
+        except subprocess.TimeoutExpired:
+            # The partial output could hold a token, so it is dropped.
+            raise WorkspaceError(
+                f"gcloud did not return an access token within {GCLOUD_TIMEOUT_SECONDS} "
+                "seconds. Run the one-time login from the README in a terminal."
+            ) from None
 
         if proc.returncode != 0:
             # stderr from gcloud may explain a missing login; it does not

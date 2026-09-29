@@ -4,12 +4,14 @@ import base64
 import email
 import json
 import urllib.parse
+from pathlib import Path
 
 import pytest
 from conftest import FakeGoogle
 
 from gcloud_workspace_mcp import gmail
 from gcloud_workspace_mcp.auth import WorkspaceError
+from gcloud_workspace_mcp.http import ResponseTooLarge
 
 
 def b64url(text: str) -> str:
@@ -173,6 +175,20 @@ def test_gmail_create_draft_reply_threads(google: FakeGoogle) -> None:
     assert mime["References"] == "<a@x> <b@x>"
 
 
+def test_reply_skips_earlier_drafts(google: FakeGoogle) -> None:
+    thread = {
+        "messages": [
+            {"labelIds": ["INBOX"], "payload": {"headers": headers(**{"Message-ID": "<a@x>"})}},
+            {"labelIds": ["DRAFT"], "payload": {"headers": headers(**{"Message-ID": "<d@x>"})}},
+        ]
+    }
+    google.queue_json(thread, {"id": "d1", "message": {"id": "m9", "threadId": "t1"}})
+    gmail.gmail_create_draft("b@x", "Re: Hi", "ok", thread_id="t1")
+    _, mime = _sent_mime(google)
+    assert mime["In-Reply-To"] == "<a@x>"
+    assert mime["References"] == "<a@x>"
+
+
 @pytest.mark.parametrize("field", ["to", "cc", "subject"])
 def test_gmail_create_draft_rejects_header_injection(field: str) -> None:
     args = {"to": "b@x", "subject": "s", "body": "b", "cc": ""}
@@ -195,6 +211,35 @@ def test_part_without_inline_data_is_skipped() -> None:
 def test_html_nested_skip_tags_and_stray_end_tags() -> None:
     html = "</style><head><title>T</title><style>x</style></head><p>kept</p><br>line"
     assert gmail.html_to_text(html) == "kept\n\nline"
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        ("line1<br>line2", "line1\nline2"),
+        ("line1<br/>line2<br />line3", "line1\nline2\nline3"),
+        ("<p>a</p><p/>b", "a\n\nb"),
+        ('go <a href="https://x.test/"/>now', "go <https://x.test/>now"),
+        ("<td/>x", "x"),
+        ("<script/>shown", "shown"),
+    ],
+)
+def test_html_self_closing_tags(html: str, expected: str) -> None:
+    assert gmail.html_to_text(html) == expected
+
+
+@pytest.mark.parametrize(
+    ("call", "name"),
+    [
+        (lambda: gmail.gmail_get_message(".."), "message_id"),
+        (lambda: gmail.gmail_get_thread(".."), "thread_id"),
+        (lambda: gmail.gmail_create_draft("a@x", "s", "b", thread_id="t/1"), "thread_id"),
+    ],
+)
+def test_gmail_tools_refuse_bad_ids(call, name: str, google: FakeGoogle) -> None:
+    with pytest.raises(WorkspaceError, match=rf"{name} .* is not a valid id"):
+        call()
+    assert google.requests == []
 
 
 def test_simplify_message_without_payload() -> None:
@@ -230,6 +275,11 @@ def test_gmail_search_clamps_max_results(google: FakeGoogle) -> None:
         {"messages": []},
         {"messages": [{"payload": {"headers": headers(Subject="no id")}}]},
         {"messages": [{}]},
+        {
+            "messages": [
+                {"labelIds": ["DRAFT"], "payload": {"headers": headers(**{"Message-ID": "<d@x>"})}}
+            ]
+        },
     ],
 )
 def test_reply_without_message_id_still_threads(google: FakeGoogle, thread: dict) -> None:
@@ -243,9 +293,9 @@ def test_reply_without_message_id_still_threads(google: FakeGoogle, thread: dict
 
 def test_reply_headers_request_only_threading_headers(google: FakeGoogle) -> None:
     google.queue_json({"messages": []})
-    gmail._reply_headers("t/1")
+    gmail._reply_headers("t1")
     url = google.requests[0].full_url
-    assert "/threads/t%2F1?" in url
+    assert "/threads/t1?" in url
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
     assert query == {"format": ["metadata"], "metadataHeaders": ["Message-ID", "References"]}
 
@@ -254,3 +304,122 @@ def test_gmail_create_draft_empty_response(google: FakeGoogle) -> None:
     google.queue_json({})
     out = json.loads(gmail.gmail_create_draft("b@x", "s", "b"))
     assert out == {"draftId": None, "messageId": None, "threadId": None}
+
+
+def _part(raw: bytes, content_type: str | None) -> dict:
+    part: dict = {
+        "mimeType": "text/plain",
+        "body": {"data": base64.urlsafe_b64encode(raw).decode().rstrip("=")},
+    }
+    if content_type is not None:
+        part["headers"] = headers(**{"Content-Type": content_type})
+    return part
+
+
+@pytest.mark.parametrize(
+    ("raw", "content_type", "expected"),
+    [
+        ("Žluťoučký kůň".encode("iso-8859-2"), "text/plain; charset=ISO-8859-2", "Žluťoučký kůň"),
+        ("Děkuji".encode("cp1250"), 'text/plain; charset="windows-1250"; format=flowed', "Děkuji"),
+        ("ü".encode(), "text/plain; charset=unknown-8bit", "ü"),
+        ("ü".encode(), "text/plain", "ü"),
+        ("ü".encode(), None, "ü"),
+    ],
+)
+def test_body_uses_declared_charset(raw: bytes, content_type: str | None, expected: str) -> None:
+    assert gmail.extract_body(_part(raw, content_type)) == expected
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        (
+            "<table><tr><td>Assignee</td><td>Jane</td></tr><tr><th>Status</th><td>Open</td></tr>"
+            "</table>",
+            "Assignee Jane\n\nStatus Open",
+        ),
+        ('<p>See <a href="https://x/y">the MR</a></p>', "See the MR <https://x/y>"),
+        ('<a href="https://x/y">https://x/y</a>', "https://x/y"),
+        ('<a href="mailto:a@x">a@x</a> or <a href="mailto:a@x">me</a>', "a@x or me <mailto:a@x>"),
+        ('<a href="#top">top</a> <a href="javascript:x()">js</a> <a>bare</a>', "top js bare"),
+        ('<head><a href="https://hidden">t</a></head>kept</a>', "kept"),
+    ],
+)
+def test_html_tables_and_links(html: str, expected: str) -> None:
+    assert gmail.html_to_text(html) == expected
+
+
+@pytest.mark.parametrize("fmt", ["raw", "full", "metadata", "minimal"])
+def test_gmail_get_message_resource_cap(google: FakeGoogle, fmt: str) -> None:
+    google.queue(ResponseTooLarge("Response is over the 1048576-byte limit."))
+    with pytest.raises(WorkspaceError, match=r"byte limit\. Use format='text'"):
+        gmail.gmail_get_message("m1", fmt)
+
+
+def test_gmail_resource_formats_request_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[int | None] = []
+
+    def fake_get(path: str, params: dict, max_bytes: int | None = None) -> dict:
+        seen.append(max_bytes)
+        return {"id": "t1", "messages": []}
+
+    monkeypatch.setattr(gmail, "_gmail_get", fake_get)
+    gmail.gmail_get_message("m1", "raw")
+    gmail.gmail_get_thread("t1", "full")
+    gmail.gmail_get_thread("t1")
+    assert seen == [gmail.MAX_RAW_BYTES, gmail.MAX_RESOURCE_BYTES, None]
+
+
+def test_gmail_get_message_raw_is_saved(google: FakeGoogle, download_dir: Path) -> None:
+    eml = b"From: a@x\r\nSubject: Hi\r\n\r\nbody\r\n"
+    raw = base64.urlsafe_b64encode(eml).decode().rstrip("=")
+    google.queue_json({"id": "m1", "threadId": "t1", "sizeEstimate": 99, "raw": raw})
+    out = json.loads(gmail.gmail_get_message("m1", "raw"))
+    path = download_dir / "m1.eml"
+    assert out == {
+        "id": "m1",
+        "threadId": "t1",
+        "sizeEstimate": 99,
+        "path": str(path),
+        "mimeType": "message/rfc822",
+        "bytes": len(eml),
+    }
+    assert path.read_bytes() == eml
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(google.requests[0].full_url).query)
+    assert query["format"] == ["raw"]
+
+
+def test_gmail_resource_other_errors_pass_through(google: FakeGoogle) -> None:
+    google.queue(WorkspaceError("boom"))
+    with pytest.raises(WorkspaceError, match=r"^boom$"):
+        gmail.gmail_get_thread("t1", "full")
+
+
+def test_simplify_matches_header_names_in_any_case() -> None:
+    # Outlook writes "CC"; Gmail passes the sender's spelling through.
+    message = {"payload": {"headers": headers(CC="c@x", SUBJECT="Hi", received="junk")}}
+    assert gmail.simplify_message(message)["headers"] == {"Cc": "c@x", "Subject": "Hi"}
+
+
+def _plain(message_id: str, body: str) -> dict:
+    return {
+        "id": message_id,
+        "payload": {"mimeType": "text/plain", "body": {"data": b64url(body)}},
+    }
+
+
+def test_gmail_get_thread_drops_oldest_bodies(
+    google: FakeGoogle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gmail, "MAX_THREAD_CHARS", 10)
+    # m1 would still fit on its own; everything older than the first miss goes.
+    thread = [_plain("m1", ""), _plain("m2", "aaa"), _plain("m3", "bbbbbb"), _plain("m4", "cccc")]
+    google.queue_json({"id": "t1", "messages": thread})
+    out = json.loads(gmail.gmail_get_thread("t1"))
+    assert [m["body"] for m in out["messages"]] == [None, None, "bbbbbb", "cccc"]
+    assert out["omittedBodies"] == ["m1", "m2"]
+
+
+def test_gmail_get_thread_within_budget_omits_nothing(google: FakeGoogle) -> None:
+    google.queue_json({"id": "t1", "messages": [_plain("m1", "a"), _plain("m2", "b")]})
+    assert "omittedBodies" not in json.loads(gmail.gmail_get_thread("t1"))

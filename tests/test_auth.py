@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import time
 
 import pytest
@@ -68,3 +69,20 @@ def test_gcloud_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(auth.subprocess, "run", missing)
     with pytest.raises(WorkspaceError, match="not found on PATH"):
         TokenCache(command=["gcloud"]).get()
+
+
+def test_gcloud_gets_no_stdin_and_a_timeout(gcloud: FakeGcloud) -> None:
+    TokenCache(command=["gcloud"]).get()
+    assert gcloud.kwargs[0]["stdin"] is subprocess.DEVNULL
+    assert gcloud.kwargs[0]["timeout"] == auth.GCLOUD_TIMEOUT_SECONDS
+
+
+def test_gcloud_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def hang(cmd: list[str], **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(cmd, 60, output="ya29.partial")
+
+    monkeypatch.setattr(auth.subprocess, "run", hang)
+    with pytest.raises(WorkspaceError, match="within 60 seconds") as info:
+        TokenCache(command=["gcloud"]).get()
+    assert "ya29" not in str(info.value)
+    assert info.value.__cause__ is None
