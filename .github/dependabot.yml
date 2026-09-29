@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Workflows pin actions by commit SHA; Dependabot bumps the SHA and the version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # uv.lock pins the dependencies the container image ships.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly

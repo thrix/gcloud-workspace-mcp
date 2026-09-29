@@ -16,7 +16,8 @@ The hooks run on every commit, and the `commit-msg` hook rejects a commit withou
 
 - file hygiene: whitespace, line endings, merge markers, large files, private keys
 - Python: `ruff check`, `ruff format`, strict `mypy` on `src/`, and `pytest`
-- packaging: `validate-pyproject` and an up-to-date `uv.lock`
+- packaging: `validate-pyproject` and an up-to-date `uv.lock`, which the container build
+  installs from
 - docs and config: `codespell`, `yamllint`, `markdownlint-cli2`
 - CI and container: `actionlint`, the GitHub workflow schema, `hadolint` on the `Containerfile`
 - secrets: `gitleaks`
@@ -47,3 +48,8 @@ container image for amd64 and arm64. Pushes to `main` and `v*` tags publish the 
 - Sign off each commit with `git commit -s` to certify the
   [Developer Certificate of Origin](https://developercertificate.org/).
 - Add a line to `CHANGELOG.md` under `Unreleased`.
+- To bump the Google Cloud SDK, change `GCLOUD_VERSION` and both `GCLOUD_SHA256_*` values in
+  the `Containerfile` together. Take the hashes from Google's
+  [versioned archives](https://cloud.google.com/sdk/docs/downloads-versioned-archives) page.
+- Workflows pin each action to a commit SHA with the version in a comment. Dependabot bumps
+  them.

@@ -24,15 +24,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
         with:
           platforms: arm64
 
       # main -> :main, v1.2.3 -> :1.2.3 :1.2 :latest, plus :sha-<short> on each push.
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -46,7 +46,7 @@ jobs:
             org.opencontainers.image.licenses=MIT
 
       - id: build
-        uses: redhat-actions/buildah-build@v3
+        uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034  # v3.1.0
         with:
           image: gcloud-workspace-mcp
           tags: ${{ steps.meta.outputs.tag-names }}
@@ -66,18 +66,22 @@ jobs:
         run: |
           init='{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}'
           for arch in amd64 arm64; do
-            printf '%s\n' \
-              "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":$init}" \
-              '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-              | timeout 120 podman run -i --rm --platform "linux/$arch" \
+            # The server stops on stdin EOF, possibly before it answers
+            # tools/list, so stdin stays open for a while (longer under qemu).
+            {
+              printf '%s\n' \
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":$init}" \
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+                '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+              sleep 30
+            } | timeout 120 podman run -i --rm --platform "linux/$arch" \
                   "${{ steps.build.outputs.image-with-tag }}" \
               | tee /dev/stderr | grep -q '"drive_search"'
           done
 
       - id: push
         if: github.event_name != 'pull_request'
-        uses: redhat-actions/push-to-registry@v3
+        uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3.0.0
         with:
           image: ${{ steps.build.outputs.image }}
           tags: ${{ steps.build.outputs.tags }}
@@ -86,7 +90,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
